@@ -1,0 +1,152 @@
+# One command: `docker compose up`.
+#
+# Secrets and passwords come from `.env` (never committed). The defaults below are for local
+# development only, so a clean checkout still starts.
+
+name: call-recording-pipeline
+
+services:
+  db:
+    image: postgres:17-alpine
+    # A worker that is killed closes its connection and releases its job lock at once. One that hangs or
+    # loses the network is detected by TCP keepalive within ~25 s, then its lock is released too.
+    command: ["postgres", "-c", "tcp_keepalives_idle=10", "-c", "tcp_keepalives_interval=5", "-c", "tcp_keepalives_count=3"]
+    environment:
+      POSTGRES_DB: callpipe
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_dev_pw}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d callpipe"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # brightsmile's CRM: the mock in crm_mock/ (slow, rate-limited, failing with CHAOS=1).
+  crm-mock:
+    build: ./crm_mock
+    environment:
+      CHAOS: ${CHAOS:-1}
+      STATE_FILE: /data/state.json
+    volumes:
+      - crm_brightsmile_data:/data   # bookings survive `docker compose down`, like a real third-party CRM
+    ports:
+      - "8080:8080"
+    healthcheck: &crm_health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The second tenant's own CRM: a second copy of the same mock, with its own state.
+  crm-mock-shopnest:
+    build: ./crm_mock
+    environment:
+      CHAOS: ${CHAOS:-1}
+      STATE_FILE: /data/state.json
+    volumes:
+      - crm_shopnest_data:/data
+    ports:
+      - "8081:8080"
+    healthcheck: *crm_health
+
+  # Creates the restricted roles and applies migrations, then exits.
+  migrate:
+    build: .
+    command: ["python", "-m", "app.migrate"]
+    environment:
+      DATABASE_URL_ADMIN: postgresql://postgres:${POSTGRES_PASSWORD:-postgres_dev_pw}@db:5432/callpipe
+      APP_API_DB_PASSWORD: ${APP_API_DB_PASSWORD:-api_dev_pw}
+      APP_WORKER_DB_PASSWORD: ${APP_WORKER_DB_PASSWORD:-worker_dev_pw}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Registers tenants and recordings and queues them, then exits. Safe to re-run.
+  ingest:
+    build: .
+    command: ["python", "-m", "app.ingest"]
+    environment:
+      DATABASE_URL_ADMIN: postgresql://postgres:${POSTGRES_PASSWORD:-postgres_dev_pw}@db:5432/callpipe
+      DATABASE_URL_WORKER: postgresql://app_worker:${APP_WORKER_DB_PASSWORD:-worker_dev_pw}@db:5432/callpipe
+      # One folder per tenant under ./data (not in the repository): data/<tenant>/manifest.json + recordings/
+      MANIFESTS: /data/brightsmile/manifest.json,/data/shopnest/manifest.json
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # The pipeline. Three workers by default; change with `docker compose up --scale worker=N`.
+  # Each one is ~70 MB and mostly waits on the speech-to-text, LLM and CRM APIs.
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    deploy:
+      replicas: 3
+    environment:
+      DATABASE_URL_WORKER: postgresql://app_worker:${APP_WORKER_DB_PASSWORD:-worker_dev_pw}@db:5432/callpipe
+      STT_PROVIDER: ${STT_PROVIDER:-elevenlabs}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      # Optional: without it, extraction falls back to rules.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-claude-haiku-5-5}
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      ingest:
+        condition: service_completed_successfully
+      crm-mock:
+        condition: service_healthy
+      crm-mock-shopnest:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # The tenant-facing API on http://localhost:8000 (docs at /docs). It only has the restricted api role.
+  api:
+    build: .
+    command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL_API: postgresql://app_api:${APP_API_DB_PASSWORD:-api_dev_pw}@db:5432/callpipe
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Operator commands, run on demand:
+  #   docker compose run --rm cli app.api_keys create brightsmile
+  #   docker compose run --rm cli app.status [--wait 600]     (exit 0 when every recording is done or failed)
+  #   docker compose run --rm cli app.reprocess [--tenant brightsmile] [--recording rec_004]
+  cli:
+    build: .
+    entrypoint: ["python", "-m"]
+    profiles: ["cli"]
+    environment:
+      DATABASE_URL_ADMIN: postgresql://postgres:${POSTGRES_PASSWORD:-postgres_dev_pw}@db:5432/callpipe
+      DATABASE_URL_WORKER: postgresql://app_worker:${APP_WORKER_DB_PASSWORD:-worker_dev_pw}@db:5432/callpipe
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Test suite: `docker compose run --rm tests`. Creates and drops its own database.
+  tests:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    environment:
+      DATABASE_URL_ADMIN: postgresql://postgres:${POSTGRES_PASSWORD:-postgres_dev_pw}@db:5432/callpipe
+      DATABASE_URL_WORKER: postgresql://app_worker:${APP_WORKER_DB_PASSWORD:-worker_dev_pw}@db:5432/callpipe
+      DATABASE_URL_API: postgresql://app_api:${APP_API_DB_PASSWORD:-api_dev_pw}@db:5432/callpipe
+      APP_API_DB_PASSWORD: ${APP_API_DB_PASSWORD:-api_dev_pw}
+      APP_WORKER_DB_PASSWORD: ${APP_WORKER_DB_PASSWORD:-worker_dev_pw}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
+  crm_brightsmile_data:
+  crm_shopnest_data:

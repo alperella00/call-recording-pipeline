@@ -1,0 +1,12 @@
+.env
+__pycache__/
+node_modules/
+.venv/
+*.log
+crm_mock/state.json
+crm_mock/state.tmp
+.DS_Store
+.stt-replay/
+docker-compose.override.yml
+reports/
+data/

@@ -1,0 +1,9 @@
+.git
+.env
+.venv
+**/__pycache__
+data
+crm_mock/state.json
+crm_mock/Dockerfile
+*.md
+.stt-replay
